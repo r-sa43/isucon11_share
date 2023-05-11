@@ -52,6 +52,7 @@ struct Isu {
     #[serde(skip)]
     updated_at: DateTime<chrono::FixedOffset>,
 }
+
 impl sqlx::FromRow<'_, sqlx::mysql::MySqlRow> for Isu {
     fn from_row(row: &sqlx::mysql::MySqlRow) -> sqlx::Result<Self> {
         use sqlx::Row as _;
@@ -98,6 +99,7 @@ struct IsuCondition {
     message: String,
     created_at: DateTime<chrono::FixedOffset>,
 }
+
 impl sqlx::FromRow<'_, sqlx::mysql::MySqlRow> for IsuCondition {
     fn from_row(row: &sqlx::mysql::MySqlRow) -> sqlx::Result<Self> {
         use sqlx::Row as _;
@@ -127,6 +129,7 @@ struct MySQLConnectionEnv {
     db_name: String,
     password: String,
 }
+
 impl Default for MySQLConnectionEnv {
     fn default() -> Self {
         let port = if let Ok(port) = std::env::var("MYSQL_PORT") {
@@ -236,7 +239,7 @@ async fn main() -> std::io::Result<()> {
     let mysql_connection_env = MySQLConnectionEnv::default();
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(10)
+        .max_connections(10) // TODO: connection数を増やしてパフォーマンスがでるか要検証
         .after_connect(|conn| {
             Box::pin(async move {
                 use sqlx::Executor as _;
@@ -278,7 +281,7 @@ async fn main() -> std::io::Result<()> {
                 actix_session::CookieSession::signed(&session_key)
                     .secure(false)
                     .name(SESSION_NAME)
-                    .max_age(2592000),
+                    .max_age(2592000), // ログアウトするまでの期限については気にしなくても良いかもしれない。TODO: パフォーマンスに関係があるか確かめはしたい
             )
             .service(post_initialize)
             .service(post_authentication)
@@ -317,11 +320,14 @@ async fn main() -> std::io::Result<()> {
 
 #[derive(Debug)]
 struct SqlxError(sqlx::Error);
+
+// Util系かも
 impl std::fmt::Display for SqlxError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
+
 impl actix_web::ResponseError for SqlxError {
     fn error_response(&self) -> HttpResponse {
         log::error!("db error: {}", self.0);
@@ -333,11 +339,13 @@ impl actix_web::ResponseError for SqlxError {
 
 #[derive(Debug)]
 struct ReqwestError(reqwest::Error);
+
 impl std::fmt::Display for ReqwestError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
+
 impl actix_web::ResponseError for ReqwestError {
     fn error_response(&self) -> HttpResponse {
         HttpResponse::InternalServerError()
@@ -391,7 +399,7 @@ async fn fetch_one_scalar<'q, 'c, O>(
 ) -> sqlx::Result<O>
     where
         O: 'q + Send + Unpin,
-        (O,): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
+        (O, ): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
 {
     match fetch_optional_scalar(query, tx).await? {
         Some(row) => Ok(row),
@@ -423,7 +431,7 @@ async fn fetch_optional_scalar<'q, 'c, O>(
 ) -> sqlx::Result<Option<O>>
     where
         O: 'q + Send + Unpin,
-        (O,): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
+        (O, ): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
 {
     let mut rows = query.fetch(tx);
     let mut resp = None;
@@ -442,7 +450,7 @@ async fn require_signed_in<'e, 'c, E>(
 ) -> actix_web::Result<String>
     where
         'c: 'e,
-        E: 'e + sqlx::Executor<'c, Database = sqlx::MySql>,
+        E: 'e + sqlx::Executor<'c, Database=sqlx::MySql>,
 {
     if let Some(jia_user_id) = session.get("jia_user_id")? {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?")
@@ -537,7 +545,7 @@ async fn post_authentication(
     let claims: Claims = token.claims;
     let jia_user_id = claims.jia_user_id;
 
-    sqlx::query("INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)")
+    sqlx::query("INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)") // TODO: DBに入れなくて良いのであれば入れない
         .bind(&jia_user_id)
         .execute(pool.as_ref())
         .await
@@ -554,7 +562,7 @@ async fn post_authentication(
 // サインアウト
 #[actix_web::post("/api/signout")]
 async fn post_signout(session: actix_session::Session) -> actix_web::Result<HttpResponse> {
-    if session.remove("jia_user_id").is_some() {
+    if session.remove("jia_user_id").is_some() { // NOTE: セッションIDがDBにたまり続ける? -> ignore intoなのでレコード数=ユーザ数
         Ok(HttpResponse::Ok().finish())
     } else {
         Err(actix_web::error::ErrorUnauthorized("you are not signed in"))
@@ -577,7 +585,7 @@ async fn get_isu_list(
     pool: web::Data<sqlx::MySqlPool>,
     session: actix_session::Session,
 ) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
+    let jia_user_id = require_signed_in(pool.as_ref(), session).await?; // TODO: ログイン状態か否かを毎回DB走査している
 
     let mut tx = pool.begin().await.map_err(SqlxError)?;
 
@@ -590,11 +598,12 @@ async fn get_isu_list(
 
     let mut response_list = Vec::new();
     for isu in isu_list {
+        // TODO: n+1問題, seqに処理してしまっている
         let last_condition: Option<IsuCondition> = fetch_optional_as(
             sqlx::query_as(
                 "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1"
             ).bind(&isu.jia_isu_uuid),
-            &mut tx
+            &mut tx,
         )
             .await
             .map_err(SqlxError)?;
@@ -654,7 +663,7 @@ async fn post_isu(
             .map_err(|_| actix_web::error::ErrorBadRequest("bad format: icon"))?
             .freeze();
         match content_disposition.get_name().unwrap() {
-            "jia_isu_uuid" => {
+            "jia_isu_uuid" => { // TODO: なぜuuidを用意するのか
                 jia_isu_uuid = Some(String::from_utf8_lossy(&content).into_owned());
             }
             "isu_name" => {
@@ -699,7 +708,7 @@ async fn post_isu(
     }
     result.map_err(SqlxError)?;
 
-    let target_url = format!(
+    let target_url = format!( // TODO: 違和感がある
         "{}/api/activate",
         get_jia_service_url(&mut tx).await.map_err(SqlxError)?
     );
@@ -739,7 +748,7 @@ async fn post_isu(
         ReqwestError(e)
     })?;
 
-    sqlx::query("UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?")
+    sqlx::query("UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?") // TODO: user_idではなくuuidで検索をかける理由を調べる
         .bind(&isu_from_jia.character)
         .bind(&jia_isu_uuid)
         .execute(&mut tx)
@@ -760,6 +769,7 @@ async fn post_isu(
     Ok(HttpResponse::Created().json(isu))
 }
 
+// [2023/05/09] ここまで
 // ISUの情報を取得
 #[actix_web::get("/api/isu/{jia_isu_uuid}")]
 async fn get_isu_id(
@@ -863,6 +873,7 @@ async fn get_isu_graph(
     Ok(HttpResponse::Ok().json(res))
 }
 
+// TODO: 怪しい
 // グラフのデータ点を一日分生成
 async fn generate_isu_graph_response(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -890,6 +901,7 @@ async fn generate_isu_graph_response(
             .unwrap();
         if truncated_condition_time != start_time_in_this_hour {
             if !conditions_in_this_hour.is_empty() {
+                // TODO: 2重ループになってるかも
                 let data = calculate_graph_data_point(&conditions_in_this_hour)?;
                 data_points.push(GraphDataPointWithInfo {
                     jia_isu_uuid: jia_isu_uuid.to_owned(),
@@ -953,6 +965,7 @@ async fn generate_isu_graph_response(
 }
 
 // 複数のISUのコンディションからグラフの一つのデータ点を計算
+// TODO: 引数のisu_conditionsのlenによっては大変そう
 fn calculate_graph_data_point(
     isu_conditions: &[IsuCondition],
 ) -> actix_web::Result<GraphDataPoint> {
@@ -1075,6 +1088,8 @@ async fn get_isu_conditions(
         None => None,
     };
 
+    // TODO: キャッシュできるかも
+    // TODO: 構造体のキャッシュへの入れ方を調べる
     let isu_name: Option<String> =
         sqlx::query_scalar("SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?")
             .bind(jia_isu_uuid.as_ref())
@@ -1114,7 +1129,7 @@ async fn get_isu_conditions_from_db(
 ) -> sqlx::Result<Vec<GetIsuConditionResponse>> {
     let conditions: Vec<IsuCondition> = if let Some(ref start_time) = start_time {
         sqlx::query_as(
-            "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ?	AND ? <= `timestamp` ORDER BY `timestamp` DESC",
+            "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ? AND ? <= `timestamp` ORDER BY `timestamp` DESC",
         )
             .bind(jia_isu_uuid)
             .bind(end_time.naive_local())
@@ -1175,6 +1190,7 @@ async fn get_trend(pool: web::Data<sqlx::MySqlPool>) -> actix_web::Result<HttpRe
 
     let mut res = Vec::new();
 
+    // TODO: for文の中にselect文
     for character in character_list {
         let isu_list: Vec<Isu> = sqlx::query_as("SELECT * FROM `isu` WHERE `character` = ?")
             .bind(&character)
@@ -1263,6 +1279,7 @@ async fn post_isu_condition(
         return Err(actix_web::error::ErrorNotFound("not found: isu"));
     }
 
+    // TODO: forの中にinsert
     for cond in req.iter() {
         let timestamp: DateTime<chrono::FixedOffset> = DateTime::from_utc(
             NaiveDateTime::from_timestamp(cond.timestamp, 0),
